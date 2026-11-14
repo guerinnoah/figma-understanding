@@ -1,0 +1,7 @@
+{
+  "name": "figma-understanding",
+  "version": "0.1.0",
+  "description": "Read-only Figma evidence acquisition and frontend handoffs",
+  "license": "MIT",
+  "keywords": ["figma", "frontend", "evidence", "design-handoff"]
+}
