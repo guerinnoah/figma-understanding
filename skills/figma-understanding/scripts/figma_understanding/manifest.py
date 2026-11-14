@@ -7,6 +7,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .flows import (
+    canonical_flow_evidence_errors,
+    flow_record_errors,
+    unresolved_connector_errors,
+)
+
 MANIFEST_VERSION = "visual-assets/v1"
 VISUAL_BINDINGS = {
     "inventory_manifest_sha256": "manifest.json",
@@ -120,7 +126,8 @@ def plan_errors(
     for key, value in expected.items():
         if plan.get(key) != value:
             errors.append(f"render plan does not match current {key}")
-    if not isinstance(plan.get("selection"), dict):
+    selection = plan.get("selection")
+    if not isinstance(selection, dict):
         errors.append("render plan selection must be an object")
     units = plan.get("units")
     if not isinstance(units, list):
@@ -163,7 +170,89 @@ def plan_errors(
         normalized = json.loads((workspace / "normalized.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return errors + ["normalized inventory is unreadable"]
+    normalized_nodes = normalized.get("nodes") if isinstance(normalized, dict) else None
+    nodes = {
+        node.get("id"): node
+        for node in normalized_nodes or []
+        if isinstance(node, dict) and isinstance(node.get("id"), str)
+    } if isinstance(normalized_nodes, list) else {}
+    page_ids = {
+        node_id for node_id, node in nodes.items() if node.get("type") == "CANVAS"
+    }
+    errors.extend(flow_record_errors(plan.get("flows"), nodes, page_ids))
+    errors.extend(unresolved_connector_errors(
+        plan.get("unresolved_connectors"),
+        nodes,
+        page_ids,
+    ))
+    try:
+        raw = json.loads((workspace / "raw" / "file.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return errors + ["raw Figma file is unreadable"]
+    document = raw.get("document") if isinstance(raw, dict) else None
+    if not isinstance(document, dict):
+        errors.append("raw Figma file has no document object")
     threads = normalized.get("threads") if isinstance(normalized, dict) else None
+    if isinstance(document, dict) and isinstance(selection, dict):
+        selector_values: dict[str, set[str] | None] = {}
+        selection_valid = True
+        for key in ("node_ids", "page_ids", "section_names", "flow_names"):
+            value = selection.get(key)
+            if value is None:
+                selector_values[key] = None
+            elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+                selector_values[key] = set(value)
+            else:
+                errors.append(f"render plan selection has invalid {key}")
+                selection_valid = False
+        max_detail = selection.get("max_detail")
+        if (
+            max_detail is not None
+            and (
+                not isinstance(max_detail, int)
+                or isinstance(max_detail, bool)
+                or max_detail < 0
+            )
+        ):
+            errors.append("render plan selection has invalid max_detail")
+            selection_valid = False
+        include_originals = selection.get("include_originals")
+        if not isinstance(include_originals, bool):
+            errors.append("render plan selection has invalid include_originals")
+            selection_valid = False
+        if selection_valid:
+            from .planner import build_render_plan
+
+            try:
+                expected_plan = build_render_plan(
+                    document,
+                    include_originals=include_originals,
+                    threads=threads if isinstance(threads, list) else [],
+                    node_ids=selector_values["node_ids"],
+                    page_ids=selector_values["page_ids"],
+                    section_names=selector_values["section_names"],
+                    flow_names=selector_values["flow_names"],
+                    max_detail=max_detail,
+                )
+            except ValueError as error:
+                errors.append(f"render plan selection is invalid: {error}")
+            else:
+                if selection != expected_plan["selection"]:
+                    errors.append("render plan selection does not match raw Figma evidence")
+                if units != expected_plan["units"]:
+                    errors.append(
+                        "render plan units do not match raw Figma evidence and selection"
+                    )
+                if plan.get("comment_links") != expected_plan["comment_links"]:
+                    errors.append(
+                        "render plan comment links do not match raw Figma evidence and selection"
+                    )
+                errors.extend(canonical_flow_evidence_errors(
+                    plan.get("flows"),
+                    plan.get("unresolved_connectors"),
+                    expected_plan["flows"],
+                    expected_plan["unresolved_connectors"],
+                ))
     expected_threads = {
         str(thread.get("thread_id")): thread
         for thread in threads or []

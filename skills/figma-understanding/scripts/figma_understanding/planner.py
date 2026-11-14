@@ -3,25 +3,63 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-PLAN_SCHEMA = "visual-plan/v1"
+from .flows import (
+    _flow_node_ids,
+    _selected_flows,
+    _selected_pages,
+    _selected_sections,
+    build_flow_evidence,
+)
+from .inventory import normalize_document_nodes
 
-CONTAINER_TYPES = {"FRAME", "SECTION", "GROUP", "COMPONENT", "COMPONENT_SET"}
-OVERVIEW_TYPES = CONTAINER_TYPES | {"INSTANCE"}
+PLAN_SCHEMA = "visual-plan/v2"
+
+CONTAINER_TYPES = {
+    "FRAME",
+    "SECTION",
+    "GROUP",
+    "COMPONENT",
+    "COMPONENT_SET",
+    "SLIDE",
+    "SLIDE_GRID",
+    "SLIDE_ROW",
+    "SLOT",
+    "WIDGET",
+}
+OVERVIEW_TYPES = CONTAINER_TYPES | {"INSTANCE", "TABLE", "TRANSFORM_GROUP"}
 NOTE_TYPES = {"STICKY"}
 FIGJAM_SHAPE_TYPES = {"SHAPE_WITH_TEXT"}
-MEDIA_TYPES = {"MEDIA", "STAMP", "WASHI_TAPE", "HIGHLIGHT"}
+MEDIA_TYPES = {
+    "CODE_BLOCK",
+    "EMBED",
+    "HIGHLIGHT",
+    "LINK_UNFURL",
+    "MEDIA",
+    "STAMP",
+    "WASHI_TAPE",
+}
+PRIMARY_SURFACE_TYPES = {"SLIDE"}
+TOP_LEVEL_DETAIL_TYPES = FIGJAM_SHAPE_TYPES | {"TEXT"}
 MAX_OVERVIEW_DIMENSION = 4096
 RENDERABLE_TYPES = (
     CONTAINER_TYPES
     | {
         "TEXT",
+        "TEXT_PATH",
         "RECTANGLE",
         "ELLIPSE",
         "VECTOR",
+        "BOOLEAN_OPERATION",
         "LINE",
         "STAR",
         "POLYGON",
+        "REGULAR_POLYGON",
+        "SLICE",
+        "TABLE",
+        "TABLE_CELL",
+        "TRANSFORM_GROUP",
         "INSTANCE",
+        "INTERACTIVE_SLIDE_ELEMENT",
         "CONNECTOR",
     }
     | NOTE_TYPES
@@ -77,6 +115,8 @@ def _walk_page(page: dict[str, Any]) -> Iterable[NodeInfo]:
             "type": str(node.get("type", "UNKNOWN")),
             "name": str(node.get("name", "")),
         },)
+        if node.get("type") == "SECTION" and node.get("sectionContentsHidden") is True:
+            return
         for child in node.get("children", []) or []:
             if isinstance(child, dict):
                 yield from walk(child, depth + 1, False, child_context)
@@ -88,6 +128,8 @@ def _walk_page(page: dict[str, Any]) -> Iterable[NodeInfo]:
 
 def _subtree_ids(node: dict[str, Any]) -> list[str]:
     ids = [str(node["id"])]
+    if node.get("type") == "SECTION" and node.get("sectionContentsHidden") is True:
+        return ids
     for child in node.get("children", []) or []:
         if isinstance(child, dict) and _visible(child):
             ids.extend(_subtree_ids(child))
@@ -109,6 +151,8 @@ def _content_occupancy(node: dict[str, Any]) -> float | None:
     container = _bounds(node)
     if container is None:
         return None
+    if node.get("type") == "SECTION" and node.get("sectionContentsHidden") is True:
+        return 0.0
     child_bounds = [
         _bounds(child)
         for child in node.get("children", []) or []
@@ -133,63 +177,28 @@ def _all_nodes(node: dict[str, Any]) -> Iterable[dict[str, Any]]:
             yield from _all_nodes(child)
 
 
-def _interaction_destinations(node: dict[str, Any]) -> set[str]:
-    destinations = set()
-    for descendant in _all_nodes(node):
-        for key in ("interactions", "reactions"):
-            interactions = descendant.get(key)
-            if not isinstance(interactions, list):
-                continue
-            for interaction in interactions:
-                if not isinstance(interaction, dict):
-                    continue
-                actions = interaction.get("actions")
-                if not isinstance(actions, list):
-                    actions = [interaction.get("action")]
-                for action in actions:
-                    if isinstance(action, dict) and action.get("destinationId"):
-                        destinations.add(str(action["destinationId"]))
-    return destinations
-
-
-def _flow_nodes(document: dict[str, Any], flow_names: set[str]) -> set[str]:
-    nodes = {str(node.get("id")): node for node in _all_nodes(document) if node.get("id")}
-    starts: dict[str, set[str]] = {}
-    start_ids: set[str] = set()
-    for page in document.get("children", []) or []:
-        if not isinstance(page, dict):
-            continue
-        for flow in page.get("flowStartingPoints", []) or []:
-            if isinstance(flow, dict) and flow.get("nodeId"):
-                node_id = str(flow["nodeId"])
-                starts.setdefault(str(flow.get("name", "")).casefold(), set()).add(node_id)
-                start_ids.add(node_id)
-    missing = {
-        name
-        for name in flow_names
-        if name not in start_ids and name.casefold() not in starts
+def _connector_matches_scope(
+    connector: dict[str, Any],
+    scope_ids: set[str],
+    nodes: dict[str, dict[str, Any]],
+    *,
+    include_section: bool = True,
+) -> bool:
+    keys = ["connector_node_id", "start_node_id", "end_node_id"]
+    if include_section:
+        keys.append("section_id")
+    direct_ids = {
+        value
+        for key in keys
+        if isinstance((value := connector.get(key)), str)
     }
-    if missing:
-        raise ValueError(f"unknown flow(s): {', '.join(sorted(missing))}")
-    ambiguous = {
-        name
-        for name in flow_names
-        if name not in start_ids and len(starts.get(name.casefold(), set())) > 1
-    }
-    if ambiguous:
-        raise ValueError(f"ambiguous flow name(s): {', '.join(sorted(ambiguous))}")
-    pending = [
-        name if name in start_ids else next(iter(starts[name.casefold()]))
-        for name in sorted(flow_names)
-    ]
-    selected = set()
-    while pending:
-        node_id = pending.pop(0)
-        if not node_id or node_id in selected:
-            continue
-        selected.add(node_id)
-        pending.extend(sorted(_interaction_destinations(nodes.get(node_id, {})) - selected))
-    return selected
+    if direct_ids & scope_ids:
+        return True
+    return any(
+        scope_ids & set(_subtree_ids(nodes[node_id]))
+        for node_id in direct_ids
+        if node_id in nodes
+    )
 
 
 def build_render_plan(
@@ -199,6 +208,7 @@ def build_render_plan(
     threads: list[dict[str, Any]] | None = None,
     node_ids: set[str] | None = None,
     page_ids: set[str] | None = None,
+    section_names: set[str] | None = None,
     flow_names: set[str] | None = None,
     max_detail: int | None = None,
 ) -> dict[str, Any]:
@@ -209,30 +219,64 @@ def build_render_plan(
     """
     if max_detail is not None and max_detail < 0:
         raise ValueError("max_detail cannot be negative")
-    all_nodes = {str(node.get("id")) for node in _all_nodes(file_document) if node.get("id")}
-    page_node_ids = {
-        str(page.get("id"))
-        for page in file_document.get("children", []) or []
-        if isinstance(page, dict) and page.get("type") == "CANVAS" and page.get("id")
+    nodes_by_id = {
+        str(node.get("id")): node
+        for node in _all_nodes(file_document)
+        if node.get("id")
     }
+    normalized_nodes = normalize_document_nodes(file_document)
+    normalized_by_id = {
+        str(node.get("id")): node
+        for node in normalized_nodes
+        if isinstance(node, dict) and node.get("id")
+    }
+    all_nodes = set(nodes_by_id)
     unknown_nodes = (node_ids or set()) - all_nodes
-    unknown_pages = (page_ids or set()) - page_node_ids
     if unknown_nodes:
         raise ValueError(f"unknown node(s): {', '.join(sorted(unknown_nodes))}")
-    if unknown_pages:
-        raise ValueError(f"unknown page(s): {', '.join(sorted(unknown_pages))}")
+    resolved_page_ids = _selected_pages(normalized_by_id, page_ids) if page_ids else []
+    selector_nodes = normalized_by_id
+    if page_ids is not None:
+        selector_nodes = {
+            node_id: node
+            for node_id, node in normalized_by_id.items()
+            if node.get("page_id") in resolved_page_ids
+        }
+    resolved_section_node_ids = (
+        _selected_sections(selector_nodes, section_names)
+        if section_names
+        else []
+    )
+    section_scope_ids = {
+        descendant_id
+        for section_id in resolved_section_node_ids
+        for descendant_id in _subtree_ids(nodes_by_id[section_id])
+    }
     units: list[dict[str, Any]] = []
     original_by_ref: dict[str, dict[str, Any]] = {}
-    flow_node_ids = _flow_nodes(file_document, flow_names) if flow_names else set()
+    available_flows, unresolved_connectors = build_flow_evidence(normalized_nodes)
+    selectable_flows = available_flows
+    if page_ids is not None:
+        selectable_flows = [
+            flow for flow in available_flows if flow.get("page_id") in resolved_page_ids
+        ]
+    selected_flows = _selected_flows(selectable_flows, flow_names) if flow_names else []
+    ordered_flow_node_ids = []
+    for flow in selected_flows:
+        for node_id in _flow_node_ids(flow):
+            if node_id not in ordered_flow_node_ids:
+                ordered_flow_node_ids.append(node_id)
+    flow_node_ids = set(ordered_flow_node_ids)
+    scoped_node_ids = set(node_ids or set()) | set(resolved_section_node_ids)
     selected_node_ids = None
-    if node_ids is not None or flow_names is not None:
-        selected_node_ids = set(node_ids or set()) | flow_node_ids
+    if node_ids is not None or section_names is not None or flow_names is not None:
+        selected_node_ids = scoped_node_ids | flow_node_ids
 
     pages = file_document.get("children", []) if file_document.get("type") == "DOCUMENT" else []
     for page in pages:
         if not isinstance(page, dict):
             continue
-        if page_ids is not None and str(page.get("id")) not in page_ids:
+        if page_ids is not None and str(page.get("id")) not in resolved_page_ids:
             continue
         tile_parents = {
             str(child.get("id"))
@@ -245,24 +289,42 @@ def build_render_plan(
         for info in _walk_page(page):
             node = info.node
             node_id = str(node.get("id", ""))
-            if not node_id or not _visible(node) or node.get("type") not in RENDERABLE_TYPES:
+            node_type = str(node.get("type"))
+            generic_fallback = (
+                node_type not in RENDERABLE_TYPES
+                and _bounds(node) is not None
+                and (info.top_level or node_id in (selected_node_ids or set()))
+            )
+            if (
+                not node_id
+                or not _visible(node)
+                or (node_type not in RENDERABLE_TYPES and not generic_fallback)
+            ):
                 continue
             name = str(node.get("name", ""))
             image_refs = _image_refs(node)
             annotated = bool(node.get("annotations"))
-            node_type = str(node.get("type"))
             parent_id = info.context_path[-1]["id"] if len(info.context_path) > 1 else None
-            adaptive_tile = info.depth == 2 and parent_id in tile_parents
+            adaptive_tile = (
+                info.depth == 2
+                and parent_id in tile_parents
+                and node_type in OVERVIEW_TYPES
+            )
             note_like = node_type in NOTE_TYPES or "note" in name.casefold() or "sticky" in name.casefold()
             roles: list[str] = []
-            if info.top_level and node_type in OVERVIEW_TYPES:
+            if (
+                (info.top_level and node_type in OVERVIEW_TYPES)
+                or node_type in PRIMARY_SURFACE_TYPES
+                or (info.top_level and generic_fallback)
+            ):
                 roles.append("overview")
             if (
                 image_refs
                 or annotated
                 or note_like
                 or node_type in MEDIA_TYPES
-                or (info.top_level and node_type == "TEXT")
+                or (info.top_level and node_type in TOP_LEVEL_DETAIL_TYPES)
+                or (not info.top_level and generic_fallback)
             ):
                 roles.append("detail")
             if adaptive_tile:
@@ -332,9 +394,15 @@ def build_render_plan(
             unit
             for unit in units
             if unit.get("node_id") in selected_node_ids
+            or unit.get("node_id") in section_scope_ids
             or bool(selected_node_ids & set(unit.get("coverage_node_ids", [])))
         ]
-    if (node_ids is not None or page_ids is not None or flow_names is not None) and not units:
+    if (
+        node_ids is not None
+        or page_ids is not None
+        or section_names is not None
+        or flow_names is not None
+    ) and not units:
         raise ValueError("selection matched no visible render units")
     if max_detail is not None:
         selected = []
@@ -346,15 +414,79 @@ def build_render_plan(
                 selected.append(unit)
                 detail_count += 1
         units = selected
+    reported_flows = selected_flows if flow_names else available_flows
+    if flow_names:
+        selected_flow_scope = {
+            node_id for flow in selected_flows for node_id in flow["scope_node_ids"]
+        }
+        unresolved_connectors = [
+            connector
+            for connector in unresolved_connectors
+            if _connector_matches_scope(connector, selected_flow_scope, nodes_by_id)
+        ]
+    if page_ids is not None:
+        reported_flows = [
+            flow for flow in reported_flows if flow.get("page_id") in resolved_page_ids
+        ]
+        unresolved_connectors = [
+            connector
+            for connector in unresolved_connectors
+            if connector.get("page_id") in resolved_page_ids
+        ]
+    if (node_ids is not None or section_names is not None) and flow_names is None:
+        node_selector_scope = {
+            descendant_id
+            for node_id in node_ids or set()
+            for descendant_id in _subtree_ids(nodes_by_id[node_id])
+        }
+        for node_id in node_ids or set():
+            current_id = normalized_by_id.get(node_id, {}).get("parent_id")
+            while isinstance(current_id, str) and current_id in normalized_by_id:
+                node_selector_scope.add(current_id)
+                current_id = normalized_by_id[current_id].get("parent_id")
+        section_selector_scope = set(resolved_section_node_ids) | section_scope_ids
+        reported_flows = [
+            flow
+            for flow in reported_flows
+            if (
+                node_selector_scope
+                & (
+                    set(flow["scope_node_ids"])
+                    - {section["node_id"] for section in flow["sections"]}
+                )
+            )
+            or section_selector_scope & set(flow["scope_node_ids"])
+        ]
+        unresolved_connectors = [
+            connector
+            for connector in unresolved_connectors
+            if _connector_matches_scope(
+                connector,
+                node_selector_scope,
+                nodes_by_id,
+                include_section=False,
+            )
+            or _connector_matches_scope(
+                connector,
+                section_selector_scope,
+                nodes_by_id,
+            )
+        ]
+    reported_flows.sort(key=lambda flow: (flow["kind"], flow["name"].casefold(), flow["flow_id"]))
     comment_links = _link_comment_threads(units, threads or [])
     return {
         "units": units,
+        "flows": reported_flows,
+        "unresolved_connectors": unresolved_connectors,
         "comment_links": comment_links,
         "selection": {
             "node_ids": sorted(node_ids) if node_ids is not None else None,
             "page_ids": sorted(page_ids) if page_ids is not None else None,
+            "resolved_page_ids": resolved_page_ids,
+            "section_names": sorted(section_names) if section_names is not None else None,
+            "resolved_section_node_ids": resolved_section_node_ids,
             "flow_names": sorted(flow_names) if flow_names is not None else None,
-            "resolved_flow_node_ids": sorted(flow_node_ids),
+            "resolved_flow_node_ids": ordered_flow_node_ids,
             "max_detail": max_detail,
             "include_originals": include_originals,
         },

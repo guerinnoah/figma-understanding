@@ -2,17 +2,12 @@
 
 ## Reporting a vulnerability
 
-Do not open a public issue for a suspected vulnerability. Use the repository
-host's private vulnerability-reporting feature. If private reporting is not
-available, contact the maintainers through the method listed on their
-repository profiles.
+Do not open a public issue for a suspected vulnerability. Use GitHub private
+vulnerability reporting. If it is unavailable, contact the maintainer through
+the method listed on their GitHub profile.
 
-Include the affected version, impact, and a minimal reproduction that contains
-no token or private Figma content. Maintainers will acknowledge the report,
-investigate it, and coordinate disclosure and a fix before public discussion.
-
-No release has been published yet. Until the first release, the default branch
-receives security fixes.
+Include the affected version, impact, and a minimal reproduction containing no
+token or private Figma content. Coordinate disclosure before public discussion.
 
 ## Trust model
 
@@ -43,5 +38,7 @@ Destination paths must remain inside the workspace visual directory.
 
 Render URLs are temporary. Original image-fill downloads are opt-in because
 their bytes may include cropped-out content. Delete workspaces according to
-the source file's data-handling requirements.
+the source file's data-handling requirements. Avoid duplicating personal data
+from rendered pixels into observations unless its exact value is necessary for
+the requested analysis.
 

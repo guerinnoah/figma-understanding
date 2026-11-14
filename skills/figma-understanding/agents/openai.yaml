@@ -1,7 +1,7 @@
 interface:
   display_name: "Figma Understanding"
-  short_description: "Build auditable Figma evidence handoffs"
-  default_prompt: "Use $figma-understanding to inspect this Figma file and produce an evidence-backed frontend handoff."
+  short_description: "Understand Figma flows and create handoffs"
+  default_prompt: "Use $figma-understanding to review this Figma file, focus on the relevant flow, and produce an evidence-backed implementation handoff."
 
 policy:
   allow_implicit_invocation: true

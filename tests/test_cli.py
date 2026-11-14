@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from figma_understanding.acquire import acquire_visuals
+from figma_understanding.cli import _acquisition_result
 from figma_understanding.manifest import sha256_file
 from tests.helpers import png
 
@@ -17,6 +18,29 @@ TOOL = ROOT / "scripts" / "figma_tool.py"
 
 
 class CLITests(unittest.TestCase):
+    def test_acquisition_result_separates_current_request_from_totals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "demo"
+            self.assertEqual(0, self.run_tool("demo", "--workspace", str(workspace)).returncode)
+            manifest = self.acquire_demo_visuals(workspace)
+            plan = json.loads((workspace / "render-plan.json").read_text())
+            selected = {unit["unit_id"] for unit in plan["units"][:2]}
+            reusable = {next(iter(selected))}
+
+            result = _acquisition_result(
+                workspace,
+                plan,
+                manifest,
+                selected,
+                reusable,
+            )
+
+        self.assertEqual(2, result["requested"])
+        self.assertEqual(1, result["downloaded_now"])
+        self.assertEqual(1, result["reused"])
+        self.assertEqual(0, result["failed_now"])
+        self.assertEqual(manifest["summary"]["downloaded"], result["total_downloaded"])
+
     def run_tool(self, *args, env=None):
         environment = os.environ.copy()
         environment.pop("FIGMA_TOKEN", None)
@@ -110,7 +134,7 @@ class CLITests(unittest.TestCase):
             plan = json.loads((workspace / "render-plan.json").read_text(encoding="utf-8"))
             manifest = json.loads((workspace / "manifest.json").read_text(encoding="utf-8"))
 
-            self.assertEqual("visual-plan/v1", plan["schema"])
+            self.assertEqual("visual-plan/v2", plan["schema"])
             self.assertEqual("complete", plan["comments_extraction_status"])
             self.assertEqual(manifest["artifacts"]["normalized.json"]["sha256"], plan["normalized_sha256"])
             link = next(item for item in plan["comment_links"] if item["thread_id"] == "c1")
@@ -148,6 +172,148 @@ class CLITests(unittest.TestCase):
             )
             self.assertNotEqual(0, invalid.returncode)
             self.assertIn("unknown node", invalid.stderr)
+
+    def test_plan_section_selector_is_applied_by_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "demo"
+            self.assertEqual(0, self.run_tool("demo", "--workspace", str(workspace)).returncode)
+            raw_path = workspace / "raw" / "file.json"
+            normalized_path = workspace / "normalized.json"
+            manifest_path = workspace / "manifest.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            normalized = json.loads(normalized_path.read_text(encoding="utf-8"))
+            raw["document"]["children"][0]["children"][0]["type"] = "SECTION"
+            next(node for node in normalized["nodes"] if node["id"] == "1:1")["type"] = "SECTION"
+            raw_path.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            normalized_path.write_text(
+                json.dumps(normalized, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["artifacts"]["raw/file.json"]["sha256"] = sha256_file(raw_path)
+            manifest["artifacts"]["normalized.json"]["sha256"] = sha256_file(normalized_path)
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_tool(
+                "plan",
+                "--workspace",
+                str(workspace),
+                "--section",
+                "Checkout",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            plan = json.loads((workspace / "render-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(["Checkout"], plan["selection"]["section_names"])
+            self.assertEqual(["1:1"], plan["selection"]["resolved_section_node_ids"])
+            self.assertEqual(
+                {"render:1-1", "render:1-3"},
+                {unit["unit_id"] for unit in plan["units"]},
+            )
+
+    def test_plan_rebuilds_flow_facts_from_raw_for_legacy_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "demo"
+            self.assertEqual(0, self.run_tool("demo", "--workspace", str(workspace)).returncode)
+            raw_path = workspace / "raw" / "file.json"
+            normalized_path = workspace / "normalized.json"
+            manifest_path = workspace / "manifest.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            normalized = json.loads(normalized_path.read_text(encoding="utf-8"))
+            raw["document"]["children"][0]["children"].extend([
+                {
+                    "id": "3:1",
+                    "type": "CONNECTOR",
+                    "connectorStart": {"endpointNodeId": "1:1"},
+                    "connectorEnd": {"endpointNodeId": "2:1"},
+                    "connectorEndStrokeCap": "LINE_ARROW",
+                },
+                {
+                    "id": "3:2",
+                    "type": "CONNECTOR",
+                    "connectorStart": {"endpointNodeId": "1:1"},
+                },
+            ])
+            normalized["nodes"].extend([
+                {
+                    "id": "3:1",
+                    "type": "CONNECTOR",
+                    "name": "",
+                    "parent_id": "0:1",
+                    "page_id": "0:1",
+                    "visible": True,
+                    "implementation": {},
+                },
+                {
+                    "id": "3:2",
+                    "type": "CONNECTOR",
+                    "name": "",
+                    "parent_id": "0:1",
+                    "page_id": "0:1",
+                    "visible": True,
+                    "implementation": {},
+                },
+            ])
+            raw_path.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            normalized_path.write_text(
+                json.dumps(normalized, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["artifacts"]["raw/file.json"]["sha256"] = sha256_file(raw_path)
+            manifest["artifacts"]["normalized.json"]["sha256"] = sha256_file(normalized_path)
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_tool("plan", "--workspace", str(workspace))
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            plan = json.loads((workspace / "render-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(["connector:3:1"], [flow["flow_id"] for flow in plan["flows"]])
+            self.assertEqual("diagram-order", plan["flows"][0]["semantics"])
+
+            plan["flows"][0]["edges"][0]["destination_node_id"] = "1:1"
+            (workspace / "render-plan.json").write_text(
+                json.dumps(plan, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            acquire = self.run_tool("acquire", "--workspace", str(workspace))
+            self.assertNotEqual(0, acquire.returncode)
+            self.assertIn("raw Figma evidence and selection", acquire.stderr)
+
+            self.assertEqual(
+                0,
+                self.run_tool("plan", "--workspace", str(workspace)).returncode,
+            )
+            plan = json.loads((workspace / "render-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(1, len(plan["unresolved_connectors"]))
+            plan["unresolved_connectors"] = []
+            (workspace / "render-plan.json").write_text(
+                json.dumps(plan, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            acquire = self.run_tool("acquire", "--workspace", str(workspace))
+            self.assertNotEqual(0, acquire.returncode)
+            self.assertIn("raw Figma evidence and selection", acquire.stderr)
+
+            self.assertEqual(
+                0,
+                self.run_tool("plan", "--workspace", str(workspace)).returncode,
+            )
+            plan = json.loads((workspace / "render-plan.json").read_text(encoding="utf-8"))
+            plan["flows"] = []
+            (workspace / "render-plan.json").write_text(
+                json.dumps(plan, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            acquire = self.run_tool("acquire", "--workspace", str(workspace))
+            self.assertNotEqual(0, acquire.returncode)
+            self.assertIn("raw Figma evidence and selection", acquire.stderr)
 
     def test_original_opt_in_is_preserved_when_filter_selects_no_originals(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -268,6 +434,52 @@ class CLITests(unittest.TestCase):
         def mismatched_render_settings(plan):
             plan["units"][0]["scale"] = 2
 
+        def noncanonical_unit(plan):
+            plan["units"][0]["name"] = "Changed after planning"
+
+        def noncanonical_comment_link(plan):
+            link = plan["comment_links"][0]
+            link["strategy"] = (
+                "smallest-covering"
+                if link["strategy"] != "smallest-covering"
+                else "exact-node"
+            )
+
+        def missing_flows(plan):
+            plan.pop("flows")
+
+        def malformed_flow(plan):
+            plan["flows"] = [{"flow_id": "broken"}]
+
+        def invalid_flow_reference(plan):
+            plan["flows"] = [{
+                "flow_id": "prototype:0:1:missing",
+                "name": "Broken",
+                "kind": "prototype",
+                "page_id": "0:1",
+                "sections": [],
+                "start_node_ids": ["missing"],
+                "unresolved_start_node_ids": [],
+                "ordering": "topological-layers",
+                "steps": [{
+                    "order": 0,
+                    "nodes": [{
+                        "node_id": "missing",
+                        "name": "Missing",
+                        "type": "FRAME",
+                    }],
+                }],
+                "edges": [],
+                "unresolved_edges": [],
+                "branch_node_ids": [],
+                "join_node_ids": [],
+                "cyclic": False,
+                "complete": True,
+            }]
+
+        def malformed_unresolved_connector(plan):
+            plan["unresolved_connectors"] = [{"connector_node_id": "missing"}]
+
         cases = (
             ("unsupported kind", unsupported_kind, "unsupported kind"),
             ("unsafe unit id", unsafe_unit_id, "unit_id"),
@@ -276,6 +488,20 @@ class CLITests(unittest.TestCase):
             ("malformed selection", malformed_selection, "selection"),
             ("malformed comment link", malformed_comment_link, "status or unit_id"),
             ("mismatched render settings", mismatched_render_settings, "render settings"),
+            ("noncanonical unit", noncanonical_unit, "units do not match raw"),
+            (
+                "noncanonical comment link",
+                noncanonical_comment_link,
+                "comment links do not match raw",
+            ),
+            ("missing flows", missing_flows, "flows must be an array"),
+            ("malformed flow", malformed_flow, "flow 0"),
+            ("invalid flow reference", invalid_flow_reference, "node evidence"),
+            (
+                "malformed unresolved connector",
+                malformed_unresolved_connector,
+                "connector_node_id",
+            ),
         )
         for name, mutate, expected in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:

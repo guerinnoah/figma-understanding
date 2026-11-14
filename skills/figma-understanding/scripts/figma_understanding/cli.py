@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from figma_understanding import __version__
-from figma_understanding.acquire import acquire_visuals
+from figma_understanding.acquire import acquire_visuals, asset_is_valid
 from figma_understanding.api import FigmaClient
 from figma_understanding.inventory import ingest, validate_workspace
 from figma_understanding.manifest import atomic_json, plan_errors, sha256_file, visual_errors
@@ -46,6 +46,7 @@ def _write_plan(
     include_originals: bool,
     node_ids: set[str] | None = None,
     page_ids: set[str] | None = None,
+    section_names: set[str] | None = None,
     flow_names: set[str] | None = None,
     max_detail: int | None = None,
 ) -> dict:
@@ -59,6 +60,7 @@ def _write_plan(
         threads=normalized.get("threads", []),
         node_ids=node_ids,
         page_ids=page_ids,
+        section_names=section_names,
         flow_names=flow_names,
         max_detail=max_detail,
     )
@@ -185,6 +187,7 @@ def _parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--include-originals", action="store_true")
     plan_parser.add_argument("--node-id", action="append")
     plan_parser.add_argument("--page", "--page-id", dest="page_id", action="append")
+    plan_parser.add_argument("--section", action="append")
     plan_parser.add_argument("--flow", action="append")
     plan_parser.add_argument("--max-detail", type=int)
     acquire_parser = sub.add_parser("acquire")
@@ -207,14 +210,29 @@ def _parser() -> argparse.ArgumentParser:
     observe_parser.add_argument("--layout", action="append", default=[])
     observe_parser.add_argument("--visual-style", action="append", default=[])
     observe_parser.add_argument("--state", action="append", default=[])
-    observe_parser.add_argument("--interaction", action="append", default=[])
-    observe_parser.add_argument("--uncertainty", action="append", default=[])
+    observe_parser.add_argument(
+        "--interaction",
+        action="append",
+        default=[],
+        help="visually inferred interaction; repeat with one matching --uncertainty",
+    )
+    observe_parser.add_argument(
+        "--uncertainty",
+        action="append",
+        default=[],
+        help="matching interaction uncertainty; without interactions, a general visual caveat",
+    )
     status_parser = sub.add_parser("status")
     status_parser.add_argument("--workspace", type=Path, required=True)
     status_parser.add_argument("--json", action="store_true")
     handoff_parser = sub.add_parser("handoff")
     handoff_parser.add_argument("--workspace", type=Path, required=True)
     handoff_parser.add_argument("--output-dir", type=Path)
+    handoff_parser.add_argument(
+        "--unit-id",
+        action="append",
+        help="include only this planned visual unit and its related evidence; repeat as needed",
+    )
     return parser
 
 
@@ -260,6 +278,7 @@ def _plan(args: argparse.Namespace) -> None:
             include_originals=args.include_originals,
             node_ids=set(args.node_id) if args.node_id else None,
             page_ids=set(args.page_id) if args.page_id else None,
+            section_names=set(args.section) if args.section else None,
             flow_names=set(args.flow) if args.flow else None,
             max_detail=args.max_detail,
         )
@@ -285,6 +304,55 @@ def _reviewed_plan(
     return reviewed, plan_path
 
 
+def _selected_plan_unit_ids(
+    plan: dict,
+    roles: set[str] | None,
+    unit_ids: set[str] | None,
+) -> set[str]:
+    return {
+        unit["unit_id"]
+        for unit in plan.get("units", [])
+        if isinstance(unit, dict)
+        and (roles is None or bool(set(unit.get("roles", [])) & roles))
+        and (unit_ids is None or unit.get("unit_id") in unit_ids)
+    }
+
+
+def _acquisition_result(
+    workspace: Path,
+    plan: dict,
+    manifest: dict,
+    selected_ids: set[str],
+    reusable_before: set[str],
+) -> dict:
+    assets = {
+        asset.get("unit_id"): asset
+        for asset in manifest.get("assets", [])
+        if isinstance(asset, dict)
+    }
+    downloaded_after = {
+        unit_id
+        for unit_id in selected_ids
+        if assets.get(unit_id, {}).get("status", {}).get("downloaded")
+        and asset_is_valid(workspace, assets[unit_id])
+    }
+    return {
+        "requested": len(selected_ids),
+        "downloaded_now": len(downloaded_after - reusable_before),
+        "reused": len(downloaded_after & reusable_before),
+        "failed_now": sum(
+            bool(assets.get(unit_id, {}).get("status", {}).get("error"))
+            and unit_id not in downloaded_after
+            for unit_id in selected_ids
+        ),
+        "total_downloaded": manifest.get("summary", {}).get("downloaded", 0),
+        "planned_not_downloaded": (
+            len(plan.get("units", []))
+            - manifest.get("summary", {}).get("downloaded", 0)
+        ),
+    }
+
+
 def _acquire(args: argparse.Namespace) -> None:
     inventory_manifest = _require_valid_workspace(args.workspace)
     raw, _ = _document(args.workspace)
@@ -295,6 +363,21 @@ def _acquire(args: argparse.Namespace) -> None:
     token = os.environ.get("FIGMA_TOKEN")
     if not token:
         raise SystemExit("FIGMA_TOKEN is not set; do not pass tokens as command arguments")
+    roles = set(args.role) if args.role else None
+    unit_ids = set(args.unit_id) if args.unit_id else None
+    selected_ids = _selected_plan_unit_ids(reviewed, roles, unit_ids)
+    previous_path = args.workspace / "visual-manifest.json"
+    reusable_before: set[str] = set()
+    if previous_path.exists():
+        previous = json.loads(previous_path.read_text(encoding="utf-8"))
+        reusable_before = {
+            str(asset.get("unit_id"))
+            for asset in previous.get("assets", [])
+            if isinstance(asset, dict)
+            and asset.get("unit_id") in selected_ids
+            and asset.get("status", {}).get("downloaded")
+            and asset_is_valid(args.workspace, asset)
+        }
     manifest = acquire_visuals(
         file_key=file_key,
         design_version=raw.get("version"),
@@ -307,12 +390,18 @@ def _acquire(args: argparse.Namespace) -> None:
             "raw_file_sha256": sha256_file(args.workspace / "raw" / "file.json"),
             "plan_sha256": sha256_file(plan_path),
         },
-        roles=set(args.role) if args.role else None,
-        unit_ids=set(args.unit_id) if args.unit_id else None,
+        roles=roles,
+        unit_ids=unit_ids,
         render_batch_size=2 if args.role == ["overview"] else 50,
     )
     print(json.dumps({
-        **manifest["summary"],
+        **_acquisition_result(
+            args.workspace,
+            reviewed,
+            manifest,
+            selected_ids,
+            reusable_before,
+        ),
         "requested_roles": args.role or ["overview", "detail"],
         "requested_units": args.unit_id or "all",
     }, sort_keys=True))
@@ -338,13 +427,17 @@ def _status(args: argparse.Namespace) -> None:
 
 def _handoff(args: argparse.Namespace) -> None:
     try:
-        json_path, markdown_path, value = write_frontend_handoff(args.workspace, args.output_dir)
+        json_path, markdown_path, value = write_frontend_handoff(
+            args.workspace,
+            args.output_dir,
+            unit_ids=set(args.unit_id) if args.unit_id else None,
+        )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise SystemExit(str(error)) from error
     print(json.dumps({
         "json": str(json_path),
         "markdown": str(markdown_path),
-        "open_decisions": len(value["open_decisions"]),
+        "unresolved_threads": len(value["unresolved_threads"]),
         "inspected_visual_units": value["coverage"]["inspected_visual_units"],
     }, sort_keys=True))
 

@@ -9,6 +9,12 @@ class SourceTests(unittest.TestCase):
         self.assertEqual("Abc_def-123", source.file_key)
         self.assertEqual("12-34", source.selected_node_id)
 
+    def test_accepts_current_figma_product_file_routes(self):
+        for route in ("board", "buzz", "design", "file", "make", "proto", "slides"):
+            with self.subTest(route=route):
+                source = parse_figma_url(f"https://www.figma.com/{route}/Abcdef/File")
+                self.assertEqual(route, source.file_type)
+
     def test_rejects_non_figma_credentials_versions_and_branches(self):
         values = [
             "https://example.com/design/Abcdef/File",

@@ -4,7 +4,7 @@ import re
 import urllib.parse
 from dataclasses import dataclass
 
-FILE_TYPES = {"design", "file", "board", "proto"}
+FILE_TYPES = {"board", "buzz", "design", "file", "make", "proto", "slides"}
 KEY_RE = re.compile(r"^[A-Za-z0-9_-]{6,256}$")
 
 
@@ -32,7 +32,7 @@ def parse_figma_url(value: str) -> FigmaSource:
         raise FigmaSourceError("Figma URL must not contain credentials or a nonstandard port")
     segments = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
     if len(segments) < 2 or segments[0] not in FILE_TYPES:
-        raise FigmaSourceError("URL is not a supported Figma design, file, board, or prototype route")
+        raise FigmaSourceError("URL is not a supported Figma file route")
     if "branch" in {segment.casefold() for segment in segments[2:]}:
         raise FigmaSourceError("nested branch routes are ambiguous; use the branch's canonical file URL")
     file_key = segments[1]

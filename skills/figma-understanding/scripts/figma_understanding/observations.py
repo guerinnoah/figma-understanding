@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,35 @@ def _read(path: Path) -> dict[str, Any]:
     return value
 
 
+@contextmanager
+def _observation_write_lock(workspace: Path):
+    """Serialize observation read-modify-write cycles across CLI processes."""
+    path = workspace / ".observations.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            if path.stat().st_size == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def record_observation(
     workspace: Path,
     unit_id: str,
@@ -33,6 +64,17 @@ def record_observation(
         for category in CATEGORIES
     }
     cleaned = {category: items for category, items in cleaned.items() if items}
+    interactions = cleaned.pop("interactions", [])
+    if interactions:
+        uncertainties = cleaned.pop("uncertainties", [])
+        if len(interactions) != len(uncertainties):
+            raise ValueError(
+                "each inferred interaction requires one matching uncertainty"
+            )
+        cleaned["inferred_interactions"] = [
+            {"claim": claim, "uncertainty": uncertainty}
+            for claim, uncertainty in zip(interactions, uncertainties)
+        ]
     if not cleaned:
         raise ValueError("at least one observation is required")
 
@@ -48,27 +90,28 @@ def record_observation(
     if not asset_is_valid(workspace, asset):
         raise ValueError(f"cannot inspect missing or modified unit: {unit_id}")
     path = workspace / "observations.json"
-    value = _read(path) if path.exists() else {
-        "schema": OBSERVATION_SCHEMA,
-        "source": {
-            "file_key": visual.get("source", {}).get("file_key"),
-            "design_version": visual.get("source", {}).get("design_version"),
-        },
-        "units": {},
-    }
-    if value.get("schema") != OBSERVATION_SCHEMA or not isinstance(value.get("units"), dict):
-        raise ValueError(f"observations must use {OBSERVATION_SCHEMA}")
-    value["units"][unit_id] = {
-        "unit_id": unit_id,
-        "node_id": asset.get("node_id"),
-        "asset_sha256": asset.get("sha256"),
-        "recorded_at": _now(),
-        "method": "agent-visual-inspection",
-        "thread_ids": asset.get("thread_ids", []),
-        "observations": cleaned,
-    }
-    atomic_json(path, value)
-    return value["units"][unit_id]
+    with _observation_write_lock(workspace):
+        value = _read(path) if path.exists() else {
+            "schema": OBSERVATION_SCHEMA,
+            "source": {
+                "file_key": visual.get("source", {}).get("file_key"),
+                "design_version": visual.get("source", {}).get("design_version"),
+            },
+            "units": {},
+        }
+        if value.get("schema") != OBSERVATION_SCHEMA or not isinstance(value.get("units"), dict):
+            raise ValueError(f"observations must use {OBSERVATION_SCHEMA}")
+        value["units"][unit_id] = {
+            "unit_id": unit_id,
+            "node_id": asset.get("node_id"),
+            "asset_sha256": asset.get("sha256"),
+            "recorded_at": _now(),
+            "method": "agent-visual-inspection",
+            "thread_ids": asset.get("thread_ids", []),
+            "observations": cleaned,
+        }
+        atomic_json(path, value)
+        return value["units"][unit_id]
 
 
 def valid_observations(

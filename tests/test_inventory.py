@@ -110,6 +110,34 @@ class InventoryTests(unittest.TestCase):
             child["implementation"]["prototype"]["reactions"][0]["action"]["destinationId"],
         )
 
+    def test_figjam_connector_endpoints_and_caps_are_preserved(self):
+        file_response = {
+            **FILE,
+            "document": {
+                "id": "0:0",
+                "type": "DOCUMENT",
+                "children": [{
+                    "id": "0:1",
+                    "type": "CANVAS",
+                    "children": [{
+                        "id": "1:1",
+                        "type": "CONNECTOR",
+                        "connectorStart": {"endpointNodeId": "2:1"},
+                        "connectorEnd": {"endpointNodeId": "3:1"},
+                        "connectorEndStrokeCap": "LINE_ARROW",
+                        "connectorLineType": "ELBOWED",
+                    }],
+                }],
+            },
+        }
+
+        value = normalize(file_response, None)
+        connector = next(node for node in value["nodes"] if node["id"] == "1:1")
+
+        self.assertEqual("2:1", connector["implementation"]["connector"]["start"]["endpointNodeId"])
+        self.assertEqual("3:1", connector["implementation"]["connector"]["end"]["endpointNodeId"])
+        self.assertEqual("LINE_ARROW", connector["implementation"]["connector"]["end_cap"])
+
     def test_ingest_preserves_raw_data_hashes_and_request_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "snapshot"

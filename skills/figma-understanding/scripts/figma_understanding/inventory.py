@@ -79,6 +79,13 @@ PROTOTYPE_FIELDS = {
     "prototypeStartNodeID": "prototype_start_node_id",
     "flowStartingPoints": "flow_starting_points",
 }
+CONNECTOR_FIELDS = {
+    "connectorStart": "start",
+    "connectorEnd": "end",
+    "connectorStartStrokeCap": "start_cap",
+    "connectorEndStrokeCap": "end_cap",
+    "connectorLineType": "line_type",
+}
 BINDING_FIELDS = {
     "styles": "styles",
     "boundVariables": "bound_variables",
@@ -106,6 +113,7 @@ def _implementation(node: dict[str, Any]) -> dict[str, Any]:
         "typography": typography,
         "component": _pick(node, COMPONENT_FIELDS),
         "prototype": _pick(node, PROTOTYPE_FIELDS),
+        "connector": _pick(node, CONNECTOR_FIELDS),
         "bindings": _pick(node, BINDING_FIELDS),
     }
     return {name: value for name, value in groups.items() if value}
@@ -144,14 +152,22 @@ def _walk(
         "implementation": _implementation(node),
     }
     yield normalized
+    children_visible = visible and not (
+        node_type == "SECTION" and node.get("sectionContentsHidden") is True
+    )
     for child in node.get("children", []) or []:
         if isinstance(child, dict):
             yield from _walk(
                 child,
                 parent_id=normalized["id"] or parent_id,
                 page_id=current_page,
-                inherited_visible=visible,
+                inherited_visible=children_visible,
             )
+
+
+def normalize_document_nodes(document: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize the document tree into the canonical flat node evidence model."""
+    return list(_walk(document))
 
 
 def _comment_node_id(comment: dict[str, Any]) -> str | None:
@@ -166,7 +182,7 @@ def normalize(file_response: dict[str, Any], comments_response: dict[str, Any] |
     document = file_response.get("document")
     if not isinstance(document, dict):
         raise ValueError("Figma file response omitted the document object")
-    nodes = list(_walk(document))
+    nodes = normalize_document_nodes(document)
     node_ids = {node["id"] for node in nodes}
     comments = comments_response.get("comments", []) if comments_response else []
     comments = comments if isinstance(comments, list) else []
